@@ -1,0 +1,6 @@
+rootfs/
+rootfs.img
+qemu.serial
+qemu.pid
+
+conf.local.mk

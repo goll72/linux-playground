@@ -1,0 +1,224 @@
+diff --git a/fs/file_table.c b/fs/file_table.c
+index ca7843dde..edf63f500 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -6,6 +6,7 @@
+  *  Copyright (C) 1997 David S. Miller (davem@caip.rutgers.edu)
+  */
+ 
++#include <linux/dcache.h>
+ #include <linux/string.h>
+ #include <linux/slab.h>
+ #include <linux/file.h>
+@@ -327,11 +328,11 @@ static inline int alloc_path_pseudo(const char *name, struct inode *inode,
+ {
+ 	struct qstr this = QSTR_INIT(name, strlen(name));
+ 
+-	path->dentry = d_alloc_pseudo(mnt->mnt_sb, &this);
++	path->dentry = d_alloc(mnt->mnt_sb->s_root, &this);
+ 	if (!path->dentry)
+ 		return -ENOMEM;
+ 	path->mnt = mntget(mnt);
+-	d_instantiate(path->dentry, inode);
++	d_add(path->dentry, inode);
+ 	return 0;
+ }
+ 
+diff --git a/fs/libfs.c b/fs/libfs.c
+index 8aa348704..07aac346c 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -4,6 +4,8 @@
+  *	Library for filesystems writers.
+  */
+ 
++#include <linux/fs.h>
++#include <linux/magic.h>
+ #include <linux/blkdev.h>
+ #include <linux/export.h>
+ #include <linux/pagemap.h>
+@@ -73,8 +75,6 @@ EXPORT_SYMBOL(simple_dentry_operations);
+  */
+ struct dentry *simple_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+ {
+-	if (dentry->d_name.len > NAME_MAX)
+-		return ERR_PTR(-ENAMETOOLONG);
+ 	if (!dentry->d_sb->s_d_op)
+ 		d_set_d_op(dentry, &simple_dentry_operations);
+ 	d_add(dentry, NULL);
+@@ -658,6 +658,9 @@ static int pseudo_fs_fill_super(struct super_block *s, struct fs_context *fc)
+ 	s->s_op = ctx->ops ?: &simple_super_operations;
+ 	s->s_xattr = ctx->xattr;
+ 	s->s_time_gran = 1;
++	s->s_flags |= SB_ACTIVE;
++
++	if (!s->s_root) {
+ 		root = new_inode(s);
+ 		if (!root)
+ 			return -ENOMEM;
+@@ -669,17 +672,23 @@ static int pseudo_fs_fill_super(struct super_block *s, struct fs_context *fc)
+ 		 */
+ 		root->i_ino = 1;
+ 		root->i_mode = S_IFDIR | S_IRUSR | S_IWUSR;
++		root->i_fop = &simple_dir_operations;
++		root->i_op = &simple_dir_inode_operations;
+ 		simple_inode_init_ts(root);
+ 		s->s_root = d_make_root(root);
+ 		if (!s->s_root)
+ 			return -ENOMEM;
++
++		s->s_root->d_op = &simple_dentry_operations;
++	}
++
+ 	s->s_d_op = ctx->dops;
+ 	return 0;
+ }
+ 
+ static int pseudo_fs_get_tree(struct fs_context *fc)
+ {
+-	return get_tree_nodev(fc, pseudo_fs_fill_super);
++	return get_tree_single(fc, pseudo_fs_fill_super);
+ }
+ 
+ static void pseudo_fs_free(struct fs_context *fc)
+@@ -706,7 +715,6 @@ struct pseudo_fs_context *init_pseudo(struct fs_context *fc,
+ 		ctx->magic = magic;
+ 		fc->fs_private = ctx;
+ 		fc->ops = &pseudo_fs_context_ops;
+-		fc->sb_flags |= SB_NOUSER;
+ 		fc->global = true;
+ 	}
+ 	return ctx;
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 328087a4d..b210a1d95 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -5493,13 +5493,14 @@ void put_mnt_ns(struct mnt_namespace *ns)
+ struct vfsmount *kern_mount(struct file_system_type *type)
+ {
+ 	struct vfsmount *mnt;
+-	mnt = vfs_kern_mount(type, SB_KERNMOUNT, type->name, NULL);
++	mnt = vfs_kern_mount(type, /* SB_KERNMOUNT */ 0, type->name, NULL);
+ 	if (!IS_ERR(mnt)) {
+ 		/*
+-		 * it is a longterm mount, don't release mnt until
+-		 * we unmount before file sys is unregistered
++		 * ~~it is a longterm mount, don't release mnt until~~
++		 * ~~we unmount before file sys is unregistered~~
++		 * Oops!
+ 		 */
+-		real_mount(mnt)->mnt_ns = MNT_NS_INTERNAL;
++		real_mount(mnt)->mnt_ns = init_task.nsproxy->mnt_ns;
+ 	}
+ 	return mnt;
+ }
+diff --git a/fs/pipe.c b/fs/pipe.c
+index 7dff2aa50..6d7b6bdb1 100644
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -5,6 +5,12 @@
+  *  Copyright (C) 1991, 1992, 1999  Linus Torvalds
+  */
+ 
++#include "linux/dcache.h"
++#include "linux/list.h"
++#include "linux/list_bl.h"
++#include "linux/net.h"
++#include "linux/rculist.h"
++#include "linux/stringhash.h"
+ #include <linux/mm.h>
+ #include <linux/file.h>
+ #include <linux/poll.h>
+@@ -740,6 +746,13 @@ pipe_release(struct inode *inode, struct file *file)
+ 	mutex_unlock(&pipe->mutex);
+ 
+ 	put_pipe_info(inode, pipe);
++
++	if (file->f_path.dentry->d_lockref.count != 1) {
++		iput(file->f_path.dentry->d_inode);
++		dput(file->f_path.dentry);
++		d_drop(file->f_path.dentry);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -877,9 +890,16 @@ static const struct dentry_operations pipefs_dentry_operations = {
+ 	.d_dname	= pipefs_dname,
+ };
+ 
++
++const struct inode_operations pipefifo_ops = {
++	.lookup = simple_lookup,
++	.getattr = simple_getattr,
++	.permission = generic_permission,
++};
++
+ static struct inode * get_pipe_inode(void)
+ {
+-	struct inode *inode = new_inode_pseudo(pipe_mnt->mnt_sb);
++	struct inode *inode = new_inode(pipe_mnt->mnt_sb);
+ 	struct pipe_inode_info *pipe;
+ 
+ 	if (!inode)
+@@ -895,6 +915,7 @@ static struct inode * get_pipe_inode(void)
+ 	pipe->files = 2;
+ 	pipe->readers = pipe->writers = 1;
+ 	inode->i_fop = &pipefifo_fops;
++	inode->i_op = &pipefifo_ops;
+ 
+ 	/*
+ 	 * Mark the inode dirty from the very beginning,
+@@ -902,7 +923,7 @@ static struct inode * get_pipe_inode(void)
+ 	 * list because "mark_inode_dirty()" will think
+ 	 * that it already _is_ on the dirty list.
+ 	 */
+-	inode->i_state = I_DIRTY;
++	// inode->i_state = I_DIRTY;
+ 	inode->i_mode = S_IFIFO | S_IRUSR | S_IWUSR;
+ 	inode->i_uid = current_fsuid();
+ 	inode->i_gid = current_fsgid();
+@@ -935,7 +956,10 @@ int create_pipe_files(struct file **res, int flags)
+ 		}
+ 	}
+ 
+-	f = alloc_file_pseudo(inode, pipe_mnt, "",
++	char buf[128];
++	snprintf(buf, sizeof buf, "pipe:[%lu]", inode->i_ino);
++
++	f = alloc_file_pseudo(inode, pipe_mnt, buf,
+ 				O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT)),
+ 				&pipefifo_fops);
+ 	if (IS_ERR(f)) {
+@@ -955,6 +979,13 @@ int create_pipe_files(struct file **res, int flags)
+ 	}
+ 	res[0]->private_data = inode->i_pipe;
+ 	res[1] = f;
++
++	struct dentry *dentry = dget(f->f_path.dentry);
++	atomic_inc(&dentry->d_inode->i_count);
++
++	dentry->d_name.hash = full_name_hash(dentry->d_parent, dentry->d_name.name, dentry->d_name.len);
++	d_rehash(dentry);
++
+ 	stream_open(inode, res[0]);
+ 	stream_open(inode, res[1]);
+ 	return 0;
+@@ -1434,11 +1465,16 @@ static const struct super_operations pipefs_ops = {
+ 
+ static int pipefs_init_fs_context(struct fs_context *fc)
+ {
++	fc->s_iflags |= SB_I_USERNS_VISIBLE;
++	fc->global = true;
++
+ 	struct pseudo_fs_context *ctx = init_pseudo(fc, PIPEFS_MAGIC);
+ 	if (!ctx)
+ 		return -ENOMEM;
++
+ 	ctx->ops = &pipefs_ops;
+-	ctx->dops = &pipefs_dentry_operations;
++	ctx->dops = &simple_dentry_operations;
++
+ 	return 0;
+ }
+ 
